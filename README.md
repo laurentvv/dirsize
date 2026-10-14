@@ -78,6 +78,13 @@ Notes:
   layouts, junctioned top-level directories).
 - Hard-linked files are counted once per directory entry (same as
   `Get-ChildItem`).
+- On Linux, already-visited directories are tracked by `(device, inode)`, so
+  bind-mount cycles cannot hang the scan and a tree bind-mounted in two places
+  is counted once (same approach as `find`/`du`). Symlinks are skipped via
+  `is_symlink()` there, which behaves correctly on POSIX.
+- File modification dates before 1970 are supported on both platforms
+  (signed FILETIME math + Win32 `SystemTimeToTzSpecificLocalTime` on Windows,
+  where the UCRT `localtime` rejects negative `time_t`).
 - Unreadable directories produce a warning on stderr and are skipped; the scan
   continues.
 - Empty subdirectories are listed with zero size/count and empty date fields.
@@ -101,8 +108,14 @@ Measured on a 90 GB / 643,000-file tree (46 top-level directories, warm cache):
 | PowerShell `Get-ChildItem -Recurse` + date aggregation | ~23.6 s |
 | `std::filesystem`-only build (initial version) | ~60 s |
 
-Cold-cache runs are disk-bound instead. On Linux the scan uses plain
-`std::filesystem`.
+On Linux, the scan reads each file's size and mtime from a single `stat()`
+call (down from two): a 41,000-file `/usr` tree scans in ~1.9 s warm, roughly
+1.5–2× faster and far more consistent than the previous `std::filesystem`
+path. Cold-cache runs are disk-bound on both platforms.
+
+Regression tests for the POSIX path (symlinks, pre-1970 dates, bind mounts,
+C++17/C++20 output identity) live in
+[`tests/run-linux-tests.sh`](tests/run-linux-tests.sh).
 
 ## License
 

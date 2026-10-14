@@ -27,6 +27,8 @@
 //     ignorés (ni suivis ni comptés : pas de boucles ni doubles comptages) ;
 //   - sous Windows le balayage est natif (FindFirstFileExW) : les métadonnées
 //     sont lues dans le buffer d'énumération, sans stat() par fichier ;
+//   - sous Linux : un seul stat() par fichier, et répertoires déjà visités
+//     détectés par (device, inode) — un bind mount en boucle ne bloque pas ;
 //   - les répertoires illisibles sont signalés sur stderr et ignorés ;
 //   - le CSV est écrit en UTF-8, trié par taille décroissante.
 
@@ -46,6 +48,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <sys/stat.h>
+#include <functional>
+#include <unordered_set>
 #endif
 
 namespace fs = std::filesystem;
@@ -82,9 +88,29 @@ static std::string formatDate(std::time_t t)
 {
     std::tm tmv{};
 #ifdef _WIN32
-    localtime_s(&tmv, &t);
+    // localtime_s (UCRT) refuse les time_t negatifs (dates < 1970) ;
+    // on passe par les API Win32 qui courent de 1601 a nos jours.
+    if (t < -11644473600LL)  // avant 1601 : hors plage FILETIME
+        return {};
+    ULARGE_INTEGER u;
+    u.QuadPart = static_cast<unsigned long long>(
+        static_cast<long long>(t) * 10000000LL + 116444736000000000LL);
+    FILETIME ft;
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    SYSTEMTIME st;
+    if (!FileTimeToSystemTime(&ft, &st) ||
+        !SystemTimeToTzSpecificLocalTime(nullptr, &st, &st))
+        return {};
+    tmv.tm_year = st.wYear - 1900;
+    tmv.tm_mon = st.wMonth - 1;
+    tmv.tm_mday = st.wDay;
+    tmv.tm_hour = st.wHour;
+    tmv.tm_min = st.wMinute;
+    tmv.tm_sec = st.wSecond;
 #else
-    localtime_r(&t, &tmv);
+    if (localtime_r(&t, &tmv) == nullptr)
+        return {};
 #endif
     char buf[32];
     if (std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv) == 0)
@@ -134,12 +160,15 @@ static void accountFile(DirStats& st, std::uintmax_t size, std::time_t t)
 
 #ifdef _WIN32
 // FILETIME (100 ns depuis 1601) -> time_t : conversion exacte, sans arrondi.
+// Calcul en signé : les dates antérieures à 1970 donnent un FILETIME dont la
+// soustraction de l'epoch dépasserait la plage non signée.
 static std::time_t fileTimeToTimeT(const FILETIME& ft)
 {
     ULARGE_INTEGER u;
     u.LowPart = ft.dwLowDateTime;
     u.HighPart = ft.dwHighDateTime;
-    return static_cast<std::time_t>((u.QuadPart - 116444736000000000ULL) / 10000000ULL);
+    const long long hundredNs = static_cast<long long>(u.QuadPart);
+    return static_cast<std::time_t>((hundredNs - 116444736000000000LL) / 10000000LL);
 }
 #endif
 
@@ -224,8 +253,39 @@ static void scanRecursive(const fs::path& dir, DirStats& st)
     FindClose(h);
 }
 #else
+// Protection anti-cycles : un bind mount peut faire boucler l'arborescence
+// (ce n'est pas un lien, le test symlink ne le voit pas). On mémorise les
+// (device, inode) des répertoires déjà visités — même approche que find/du.
+namespace {
+struct DevIno {
+    dev_t dev;
+    ino_t ino;
+    bool operator==(const DevIno& other) const
+    { return dev == other.dev && ino == other.ino; }
+};
+struct DevInoHash {
+    std::size_t operator()(const DevIno& k) const noexcept
+    {
+        const auto h = std::hash<unsigned long long>{};
+        return h(static_cast<unsigned long long>(k.dev)) * 1315423911ULL
+             ^ h(static_cast<unsigned long long>(k.ino));
+    }
+};
+std::unordered_set<DevIno, DevInoHash> g_visitedDirs;
+} // namespace
+
+static bool alreadyScanned(const fs::path& dir)
+{
+    struct stat sb;
+    if (::stat(dir.c_str(), &sb) != 0)
+        return false;  // stat indisponible : on tente le scan quand même
+    return !g_visitedDirs.insert({sb.st_dev, sb.st_ino}).second;
+}
+
 static void scanRecursive(const fs::path& dir, DirStats& st)
 {
+    if (alreadyScanned(dir))
+        return;  // déjà visité : bind mount en amont, ou cycle
     std::error_code ec;
     fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
     if (ec) {
@@ -237,10 +297,15 @@ static void scanRecursive(const fs::path& dir, DirStats& st)
         std::error_code lec;
         if (entry.is_symlink(lec))
             continue;
-        if (entry.is_directory(lec))
+        if (entry.is_directory(lec)) {
             scanRecursive(entry.path(), st);
-        else if (entry.is_regular_file(lec))
-            addFile(entry, st);
+        } else if (entry.is_regular_file(lec)) {
+            // Un seul stat() par fichier : taille et mtime d'un seul appel,
+            // st_mtime étant déjà un time_t exact (signé : dates < 1970 OK).
+            struct stat sb;
+            if (::stat(entry.path().c_str(), &sb) == 0)
+                accountFile(st, static_cast<std::uintmax_t>(sb.st_size), sb.st_mtime);
+        }
     }
 }
 #endif
