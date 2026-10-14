@@ -113,9 +113,16 @@ call (down from two): a 41,000-file `/usr` tree scans in ~1.9 s warm, roughly
 1.5–2× faster and far more consistent than the previous `std::filesystem`
 path. Cold-cache runs are disk-bound on both platforms.
 
-Regression tests for the POSIX path (symlinks, pre-1970 dates, bind mounts,
-C++17/C++20 output identity) live in
-[`tests/run-linux-tests.sh`](tests/run-linux-tests.sh).
+Regression tests live in [`tests/`](tests/): `run-windows-tests.ps1` covers
+junctions, exact boundary dates and pre-1970 dates on both Windows code paths
+(first-level `GetFileAttributesExW` and native recursive scan); the Linux
+suite (`run-linux-tests.sh`) covers symlinks, pre-1970 dates, bind mounts and
+C++17/C++20 output identity.
+
+Note for MinGW users: `std::chrono::clock_cast` in libstdc++ returns `-1`
+for file times before 1970 (while `fs::last_write_time` is correct), which is
+why all Windows date handling uses exact integer FILETIME math instead of
+`<chrono>`.
 
 ## License
 

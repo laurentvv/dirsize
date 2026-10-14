@@ -65,12 +65,14 @@ struct DirStats {
     bool hasDate = false;      // au moins un fichier daté trouvé
 };
 
-// Conversion fs::file_time_type -> time_t.
-// En C++20 complet (GCC >= 13, MSVC 2019 16.10+), chrono::clock_cast fait la
-// conversion exacte. Sur les compilateurs plus anciens (ex. GCC 11 d'Ubuntu
-// 22.04), repli sur la traduction de l'écart par rapport à "maintenant" :
-// fileNow est échantillonné AVANT sysNow, donc l'écart résiduel (quelques µs)
-// est positif et la troncature à la seconde reste exacte.
+// Conversion fs::file_time_type -> time_t (chemin POSIX uniquement : sous
+// Windows, toutes les dates passent par la conversion FILETIME entière).
+// En C++20 complet (GCC >= 13), chrono::clock_cast fait la conversion exacte.
+// Sur les compilateurs plus anciens (ex. GCC 11 d'Ubuntu 22.04), repli sur la
+// traduction de l'écart par rapport à "maintenant" : fileNow est échantillonné
+// AVANT sysNow, donc l'écart résiduel (quelques µs) est positif et la
+// troncature à la seconde reste exacte.
+#ifndef _WIN32
 static std::time_t toTimeT(const fs::file_time_type& ftime)
 {
     using namespace std::chrono;
@@ -83,6 +85,7 @@ static std::time_t toTimeT(const fs::file_time_type& ftime)
     return system_clock::to_time_t(asSystem);
 #endif
 }
+#endif
 
 static std::string formatDate(std::time_t t)
 {
@@ -172,7 +175,26 @@ static std::time_t fileTimeToTimeT(const FILETIME& ft)
 }
 #endif
 
-// Fichiers du premier niveau (peu nombreux) : acces direct via std::filesystem.
+// Fichiers du premier niveau (peu nombreux).
+#ifdef _WIN32
+// Un seul appel GetFileAttributesExW fournit taille et dates. On évite
+// std::filesystem/chrono ici : clock_cast de libstdc++ (MinGW) renvoie -1
+// pour les dates antérieures à 1970 (vérifié : fs::last_write_time est
+// correct, c'est la conversion chrono qui sature).
+static void addFile(const fs::directory_entry& entry, DirStats& st)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(entry.path().wstring().c_str(),
+                              GetFileExInfoStandard, &fad))
+        return;
+    if (fad.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))
+        return;
+    ULARGE_INTEGER sz;
+    sz.LowPart = fad.nFileSizeLow;
+    sz.HighPart = fad.nFileSizeHigh;
+    accountFile(st, sz.QuadPart, fileTimeToTimeT(fad.ftLastWriteTime));
+}
+#else
 static void addFile(const fs::directory_entry& entry, DirStats& st)
 {
     std::error_code ec;
@@ -184,6 +206,7 @@ static void addFile(const fs::directory_entry& entry, DirStats& st)
         return;
     accountFile(st, sz, toTimeT(wt));
 }
+#endif
 
 // Fusionne les stats d'un sous-ensemble dans un accumulateur (pour le TOTAL).
 static void mergeInto(DirStats& dst, const DirStats& src)
