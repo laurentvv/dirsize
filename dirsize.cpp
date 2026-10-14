@@ -23,7 +23,10 @@
 //
 // Notes :
 //   - les dates utilisées sont les dates de dernière modification des fichiers ;
-//   - les liens symboliques sont ignorés (évite les boucles et doubles comptages) ;
+//   - les liens symboliques, jonctions NTFS et autres points d'analyse sont
+//     ignorés (ni suivis ni comptés : pas de boucles ni doubles comptages) ;
+//   - sous Windows le balayage est natif (FindFirstFileExW) : les métadonnées
+//     sont lues dans le buffer d'énumération, sans stat() par fichier ;
 //   - les répertoires illisibles sont signalés sur stderr et ignorés ;
 //   - le CSV est écrit en UTF-8, trié par taille décroissante.
 
@@ -36,6 +39,14 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -108,18 +119,10 @@ static std::string csvQuote(const std::string& s)
     return out;
 }
 
-static void addFile(const fs::directory_entry& entry, DirStats& st)
+static void accountFile(DirStats& st, std::uintmax_t size, std::time_t t)
 {
-    std::error_code ec;
-    const std::uintmax_t sz = entry.file_size(ec);
-    if (!ec)
-        st.size += sz;
+    st.size += size;
     ++st.files;
-
-    const auto wt = entry.last_write_time(ec);
-    if (ec)
-        return;
-    const std::time_t t = toTimeT(wt);
     if (!st.hasDate) {
         st.oldest = st.newest = t;
         st.hasDate = true;
@@ -127,6 +130,30 @@ static void addFile(const fs::directory_entry& entry, DirStats& st)
         if (t < st.oldest) st.oldest = t;
         if (t > st.newest) st.newest = t;
     }
+}
+
+#ifdef _WIN32
+// FILETIME (100 ns depuis 1601) -> time_t : conversion exacte, sans arrondi.
+static std::time_t fileTimeToTimeT(const FILETIME& ft)
+{
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return static_cast<std::time_t>((u.QuadPart - 116444736000000000ULL) / 10000000ULL);
+}
+#endif
+
+// Fichiers du premier niveau (peu nombreux) : acces direct via std::filesystem.
+static void addFile(const fs::directory_entry& entry, DirStats& st)
+{
+    std::error_code ec;
+    const std::uintmax_t sz = entry.file_size(ec);
+    if (ec)
+        return;
+    const auto wt = entry.last_write_time(ec);
+    if (ec)
+        return;
+    accountFile(st, sz, toTimeT(wt));
 }
 
 // Fusionne les stats d'un sous-ensemble dans un accumulateur (pour le TOTAL).
@@ -146,6 +173,57 @@ static void mergeInto(DirStats& dst, const DirStats& src)
     }
 }
 
+#ifdef _WIN32
+// Jonction NTFS / point d'analyse ? libstdc++ (MinGW) ne les classe PAS comme
+// des symlinks — il faut tester l'attribut explicitement, sinon la cible de la
+// jonction serait suivie et comptée deux fois.
+static bool isReparsePoint(const fs::path& p)
+{
+    const DWORD attrs = GetFileAttributesW(p.wstring().c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
+// Balayage natif : l'énumération FindFirstFileW/FindNextFileW fournit déjà
+// taille, date et attributs dans son buffer — aucun appel stat() supplémentaire
+// par fichier. Les points d'analyse (jonctions, liens) sont écartés d'emblée.
+static void scanRecursive(const fs::path& dir, DirStats& st)
+{
+    std::wstring pattern = dir.wstring();
+    for (wchar_t& c : pattern)
+        if (c == L'/')
+            c = L'\\';
+    if (!pattern.empty() && pattern.back() != L'\\')
+        pattern += L'\\';
+    pattern += L'*';
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
+                                FindExSearchNameMatch, nullptr,
+                                FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) {
+        std::cerr << "avertissement : lecture impossible de " << toUtf8(dir)
+                  << " (erreur Windows " << GetLastError() << ")\n";
+        return;
+    }
+    do {
+        const bool isDot = fd.cFileName[0] == L'.' &&
+            (fd.cFileName[1] == L'\0' ||
+             (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0'));
+        if (isDot || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+            continue;  // "." / ".." et liens symboliques / jonctions : ignorés
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            scanRecursive(dir / fd.cFileName, st);
+        } else {
+            ULARGE_INTEGER sz;
+            sz.LowPart = fd.nFileSizeLow;
+            sz.HighPart = fd.nFileSizeHigh;
+            accountFile(st, sz.QuadPart, fileTimeToTimeT(fd.ftLastWriteTime));
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+#else
 static void scanRecursive(const fs::path& dir, DirStats& st)
 {
     std::error_code ec;
@@ -165,6 +243,7 @@ static void scanRecursive(const fs::path& dir, DirStats& st)
             addFile(entry, st);
     }
 }
+#endif
 
 int main(int argc, char* argv[])
 {
@@ -196,6 +275,10 @@ int main(int argc, char* argv[])
         if (entry.is_symlink(e2))
             continue;
         if (entry.is_directory(e2)) {
+#ifdef _WIN32
+            if (isReparsePoint(entry.path()))
+                continue;  // jonction NTFS : jamais suivie
+#endif
             DirStats st;
             st.name = toUtf8(entry.path().filename());
             scanRecursive(entry.path(), st);

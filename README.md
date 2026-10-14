@@ -70,7 +70,14 @@ Notes:
 
 - Dates are file **last-modification** times, displayed in local time as
   `YYYY-MM-DD HH:MM:SS`.
-- Symbolic links and junctions are skipped (no loops, no double counting).
+- Symbolic links, NTFS junctions and other reparse points are **never followed
+  and never counted** — no loops, no double counting. On Windows this is
+  enforced at the enumeration level (`FILE_ATTRIBUTE_REPARSE_POINT`), matching
+  the default behavior of `Get-ChildItem -Recurse`. Outputs were verified
+  byte-exact against PowerShell on junction-heavy trees (pnpm `node_modules`
+  layouts, junctioned top-level directories).
+- Hard-linked files are counted once per directory entry (same as
+  `Get-ChildItem`).
 - Unreadable directories produce a warning on stderr and are skipped; the scan
   continues.
 - Empty subdirectories are listed with zero size/count and empty date fields.
@@ -82,8 +89,20 @@ Notes:
 
 ## Performance
 
-A ~90 GB tree with 645,000 files across 46 subdirectories scans in about
-2 minutes on a consumer machine — disk-bound, not CPU-bound.
+On Windows the scan is native (`FindFirstFileExW` with `FIND_FIRST_EX_LARGE_FETCH`):
+each enumeration buffer already carries size, timestamps and attributes, so no
+per-file `stat()` call is ever issued.
+
+Measured on a 90 GB / 643,000-file tree (46 top-level directories, warm cache):
+
+| Tool | Time |
+|---|---|
+| **dirsize** (native Windows scan) | **~2.9 s** |
+| PowerShell `Get-ChildItem -Recurse` + date aggregation | ~23.6 s |
+| `std::filesystem`-only build (initial version) | ~60 s |
+
+Cold-cache runs are disk-bound instead. On Linux the scan uses plain
+`std::filesystem`.
 
 ## License
 
