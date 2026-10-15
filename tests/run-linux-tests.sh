@@ -13,6 +13,7 @@ check() { if [ "$1" = "$2" ]; then echo "PASS: $3"; PASS=$((PASS+1)); else echo 
 
 g++ -std=c++17 -O2 -Wall -Wextra dirsize.cpp -o "$W/ds17" -lstdc++fs
 g++ -std=c++20 -O2 -Wall -Wextra dirsize.cpp -o "$W/ds20"
+g++ -std=c++11 -O2 -Wall -Wextra dirsize-legacy.cpp -o "$W/dslegacy"
 
 # --- symlinks : repertoire non suivi, fichier non compte, cycle sans boucle
 mkdir -p "$W/ts/real/deep"
@@ -48,6 +49,11 @@ fi
 "$W/ds17" /usr "$W/u17.csv" >/dev/null 2>&1
 "$W/ds20" /usr "$W/u20.csv" >/dev/null 2>&1
 if diff -q "$W/u17.csv" "$W/u20.csv" >/dev/null; then echo "PASS: /usr identique c++17/c++20"; PASS=$((PASS+1)); else echo "FAIL: /usr differe entre c++17 et c++20"; FAIL=$((FAIL+1)); fi
+
+# --- variante legacy (GCC 4.8.5, C++11/POSIX) : sortie identique au principal
+"$W/dslegacy" "$W/ts" "$W/ts_leg.csv" >/dev/null 2>&1
+"$W/ds20"     "$W/ts" "$W/ts_c20.csv" >/dev/null 2>&1
+if diff -q "$W/ts_c20.csv" "$W/ts_leg.csv" >/dev/null; then echo "PASS: legacy (c++11) identique au principal"; PASS=$((PASS+1)); else echo "FAIL: legacy differe du principal"; diff "$W/ts_c20.csv" "$W/ts_leg.csv"; FAIL=$((FAIL+1)); fi
 
 echo "----------------------------------------"
 echo "Resultat : $PASS pass, $FAIL fail"

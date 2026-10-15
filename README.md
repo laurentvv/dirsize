@@ -53,8 +53,17 @@ locales):
 |---|---|
 | Linux / WSL (GCC ≥ 10) | `g++ -std=c++20 -O2 dirsize.cpp -o dirsize` |
 | Old GCC (CentOS/RHEL 8, GCC 8–9) | `g++ -std=c++17 -O2 dirsize.cpp -o dirsize -lstdc++fs` |
+| **Very old GCC (CentOS/RHEL 7, GCC 4.8.5)** | `g++ -std=c++11 -O2 dirsize-legacy.cpp -o dirsize` |
 | Windows (MinGW / MSYS2) | `g++ -std=c++20 -O2 -static dirsize.cpp -o dirsize.exe` |
 | Windows (MSVC) | `cl /std:c++20 /EHsc dirsize.cpp` |
+
+For locked-down production machines that cannot install devtoolset or any
+newer compiler, `dirsize-legacy.cpp` is a C++11 / pure-POSIX variant of the
+tool (`dirent.h` + `lstat`, no `std::filesystem`, no external dependency).
+It produces byte-identical CSV output to `dirsize.cpp` on Linux (validated on
+a full `/usr` tree plus symlink / bind-mount / pre-1970 fixtures), keeps the
+`(device, inode)` bind-mount cycle protection, and counts symlinks the same
+way.
 
 Notes:
 
