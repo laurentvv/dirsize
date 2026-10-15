@@ -164,8 +164,7 @@ static void writeCsv(const std::string& outPath, const std::vector<DirStats>& ro
         std::cerr << "erreur : impossible de creer " << outPath << "\n";
         std::exit(1);
     }
-    out << "\"nom rep\";\"taille\";\"nombre de fichiers\";"
-           "\"date du fichier le plus ancien\";\"date du fichier le plus recent\"\r\n";
+    out << "nom_repertoire;taille;nb_fichier;date_fichier_old;date_fichier_recent\r\n";
     for (std::size_t i = 0; i < rows.size(); ++i) {
         out << csvQuote(rows[i].name) << ';'
             << rows[i].size << ';'

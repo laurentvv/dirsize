@@ -6,11 +6,11 @@ nesting levels included):
 
 | Column | Description |
 |---|---|
-| `nom rep` | Subdirectory name |
+| `nom_repertoire` | Subdirectory name |
 | `taille` | Total size of all files, in bytes |
-| `nombre de fichiers` | File count (recursive) |
-| `date du fichier le plus ancien` | Oldest file modification date |
-| `date du fichier le plus récent` | Newest file modification date |
+| `nb_fichier` | File count (recursive) |
+| `date_fichier_old` | Oldest file modification date |
+| `date_fichier_recent` | Newest file modification date |
 
 Rows are sorted by size (largest first) and a `TOTAL` row is appended at the
 end, including files sitting directly in the scanned root.
@@ -40,12 +40,15 @@ Resulting CSV (semicolon-separated, opens directly in Excel — including French
 locales):
 
 ```csv
-"nom rep";"taille";"nombre de fichiers";"date du fichier le plus ancien";"date du fichier le plus recent"
+nom_repertoire;taille;nb_fichier;date_fichier_old;date_fichier_recent
 "backups";32213321244;1;2021-04-26 15:45:50;2026-10-14 23:19:00
 "website";45678901;312;2019-06-01 12:00:00;2026-10-14 19:38:41
 "empty-dir";0;0;;
 "TOTAL (projects)";3225899...;313;2019-06-01 12:00:00;2026-10-14 23:19:00
 ```
+
+The header line is unquoted; directory names are quoted (with standard `""`
+escaping) so a name containing `;` cannot break the CSV.
 
 ## Building
 

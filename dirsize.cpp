@@ -398,8 +398,7 @@ int main(int argc, char* argv[])
 #ifdef _WIN32
     out << "\xEF\xBB\xBF";  // BOM UTF-8 : accents corrects a l'ouverture dans Excel
 #endif
-    out << "\"nom rep\";\"taille\";\"nombre de fichiers\";"
-           "\"date du fichier le plus ancien\";\"date du fichier le plus recent\"\r\n";
+    out << "nom_repertoire;taille;nb_fichier;date_fichier_old;date_fichier_recent\r\n";
 
     const auto writeRow = [&out](const DirStats& st) {
         out << csvQuote(st.name) << ';'
