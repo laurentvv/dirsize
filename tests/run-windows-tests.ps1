@@ -22,9 +22,17 @@ Remove-Item -Recurse -Force $W -ErrorAction SilentlyContinue
 # d/sub_1960  : date < 1970 en sous-repertoire (chemin natif).
 # d/sub_2020  : date pile sur la seconde (frontiere de troncature).
 # target + j  : cible de jonction ; j ne doit jamais etre suivi ni compte.
+# deep        : arborescence tres profonde (parcours iteratif sans debordement de pile).
 foreach ($d in "t\d", "t\target", "t\vide") {
     New-Item -ItemType Directory -Force (Join-Path $W $d) | Out-Null
 }
+$deepPath = Join-Path $W "t\deep"
+for ($i = 1; $i -le 60; $i++) {
+    $deepPath = Join-Path $deepPath "lvl$i"
+}
+New-Item -ItemType Directory -Force $deepPath | Out-Null
+[IO.File]::WriteAllBytes((Join-Path $deepPath "leaf.bin"), (New-Object byte[] 100))
+
 [IO.File]::WriteAllBytes("$W\t\racine_1950.txt", (New-Object byte[] 10))
 [IO.File]::WriteAllBytes("$W\t\d\sub_1960.txt",  (New-Object byte[] 20))
 [IO.File]::WriteAllBytes("$W\t\d\sub_2020.txt",  (New-Object byte[] 30))
@@ -49,8 +57,9 @@ foreach ($l in (Get-Content "$W\out.csv" | Select-Object -Skip 1)) {
 Check "jonction enfant ignoree (aucune ligne 'j')"         (-not $rows.ContainsKey("j"))
 Check "cible comptee une seule fois (3000 o / 3 fichiers)" ($rows["target"] -match '"target";3000;3;')
 Check "sous-rep : dates exactes 1960 et 2020"              ($rows["d"] -eq '"d";50;2;1960-05-04 12:00:00;2020-01-15 10:30:00')
-Check "TOTAL : taille 3060 o / 6 fichiers"                 ($rows["TOTAL (t)"] -match ';3060;6;')
-Check "TOTAL : plus ancien = fichier racine 1950 (pre-1970, 1er niveau)" ($rows["TOTAL (t)"] -match ';3060;6;1950-11-30 08:45:00;')
+Check "arborescence profonde (60 niveaux iteratifs)"       ($rows["deep"] -match '"deep";100;1;')
+Check "TOTAL : taille 3160 o / 7 fichiers"                 ($rows["TOTAL (t)"] -match ';3160;7;')
+Check "TOTAL : plus ancien = fichier racine 1950 (pre-1970, 1er niveau)" ($rows["TOTAL (t)"] -match ';3160;7;1950-11-30 08:45:00;')
 Check "repertoire vide : dates vides"                      ($rows["vide"] -eq '"vide";0;0;;')
 
 Remove-Item -Recurse -Force $W -ErrorAction SilentlyContinue

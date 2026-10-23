@@ -177,8 +177,14 @@ static void writeCsv(const std::string& outPath, const std::vector<DirStats>& ro
         << total.files << ';'
         << (total.hasDate ? formatDate(total.oldest) : "") << ';'
         << (total.hasDate ? formatDate(total.newest) : "") << "\r\n";
+    out.flush();
     if (!out) {
         std::cerr << "erreur : echec d'ecriture dans " << outPath << "\n";
+        std::exit(1);
+    }
+    out.close();
+    if (!out) {
+        std::cerr << "erreur : echec de fermeture de " << outPath << "\n";
         std::exit(1);
     }
 }

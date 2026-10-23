@@ -26,9 +26,12 @@
 //   - les liens symboliques, jonctions NTFS et autres points d'analyse sont
 //     ignorés (ni suivis ni comptés : pas de boucles ni doubles comptages) ;
 //   - sous Windows le balayage est natif (FindFirstFileExW) : les métadonnées
-//     sont lues dans le buffer d'énumération, sans stat() par fichier ;
+//     sont lues dans le buffer d'énumération, sans stat() par fichier, et
+//     les répertoires déjà visités sont détectés par identifiant de fichier Win32 ;
 //   - sous Linux : un seul stat() par fichier, et répertoires déjà visités
 //     détectés par (device, inode) — un bind mount en boucle ne bloque pas ;
+//   - parcours itératif avec pile explicite : aucun risque de débordement de pile
+//     même sur les arborescences extrêmement profondes ;
 //   - les répertoires illisibles sont signalés sur stderr et ignorés ;
 //   - le CSV est écrit en UTF-8, trié par taille décroissante.
 
@@ -38,8 +41,10 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -50,8 +55,6 @@
 #include <windows.h>
 #else
 #include <sys/stat.h>
-#include <functional>
-#include <unordered_set>
 #endif
 
 namespace fs = std::filesystem;
@@ -162,6 +165,21 @@ static void accountFile(DirStats& st, std::uintmax_t size, std::time_t t)
 }
 
 #ifdef _WIN32
+static std::wstring toExtendedPath(const fs::path& p)
+{
+    std::wstring ws = p.wstring();
+    for (wchar_t& c : ws)
+        if (c == L'/')
+            c = L'\\';
+    if (ws.rfind(L"\\\\?\\", 0) == 0 || ws.rfind(L"\\\\.\\", 0) == 0)
+        return ws;
+    if (ws.rfind(L"\\\\", 0) == 0)
+        return L"\\\\?\\UNC\\" + ws.substr(2);
+    if (ws.size() >= 3 && ws[1] == L':' && ws[2] == L'\\')
+        return L"\\\\?\\" + ws;
+    return ws;
+}
+
 // FILETIME (100 ns depuis 1601) -> time_t : conversion exacte, sans arrondi.
 // Calcul en signé : les dates antérieures à 1970 donnent un FILETIME dont la
 // soustraction de l'epoch dépasserait la plage non signée.
@@ -184,7 +202,7 @@ static std::time_t fileTimeToTimeT(const FILETIME& ft)
 static void addFile(const fs::directory_entry& entry, DirStats& st)
 {
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExW(entry.path().wstring().c_str(),
+    if (!GetFileAttributesExW(toExtendedPath(entry.path()).c_str(),
                               GetFileExInfoStandard, &fad))
         return;
     if (fad.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))
@@ -226,54 +244,106 @@ static void mergeInto(DirStats& dst, const DirStats& src)
 }
 
 #ifdef _WIN32
+// Protection anti-cycles : détection des répertoires déjà visités par leur
+// identifiant unique de fichier Win32 (numéro de série du volume + index fichier).
+namespace {
+struct WinDirId {
+    DWORD volumeSerialNumber;
+    DWORD fileIndexHigh;
+    DWORD fileIndexLow;
+    bool operator==(const WinDirId& o) const noexcept
+    {
+        return volumeSerialNumber == o.volumeSerialNumber &&
+               fileIndexHigh == o.fileIndexHigh &&
+               fileIndexLow == o.fileIndexLow;
+    }
+};
+struct WinDirIdHash {
+    std::size_t operator()(const WinDirId& k) const noexcept
+    {
+        const auto h = std::hash<unsigned long long>{};
+        return h(static_cast<unsigned long long>(k.volumeSerialNumber)) * 1315423911ULL
+             ^ (static_cast<unsigned long long>(k.fileIndexHigh) << 32 | k.fileIndexLow);
+    }
+};
+std::unordered_set<WinDirId, WinDirIdHash> g_visitedDirs;
+} // namespace
+
+static bool alreadyScanned(const fs::path& dir)
+{
+    HANDLE h = CreateFileW(toExtendedPath(dir).c_str(), 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    BY_HANDLE_FILE_INFORMATION fi;
+    const BOOL ok = GetFileInformationByHandle(h, &fi);
+    CloseHandle(h);
+    if (!ok)
+        return false;
+    if (fi.nFileIndexHigh == 0 && fi.nFileIndexLow == 0)
+        return false;
+    return !g_visitedDirs.insert({fi.dwVolumeSerialNumber, fi.nFileIndexHigh, fi.nFileIndexLow}).second;
+}
+
 // Jonction NTFS / point d'analyse ? libstdc++ (MinGW) ne les classe PAS comme
 // des symlinks — il faut tester l'attribut explicitement, sinon la cible de la
 // jonction serait suivie et comptée deux fois.
 static bool isReparsePoint(const fs::path& p)
 {
-    const DWORD attrs = GetFileAttributesW(p.wstring().c_str());
+    const DWORD attrs = GetFileAttributesW(toExtendedPath(p).c_str());
     return attrs != INVALID_FILE_ATTRIBUTES &&
            (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 }
 
-// Balayage natif : l'énumération FindFirstFileW/FindNextFileW fournit déjà
+// Balayage natif itératif : l'énumération FindFirstFileW/FindNextFileW fournit déjà
 // taille, date et attributs dans son buffer — aucun appel stat() supplémentaire
-// par fichier. Les points d'analyse (jonctions, liens) sont écartés d'emblée.
-static void scanRecursive(const fs::path& dir, DirStats& st)
+// par fichier. Les points d'analyse (jonctions, liens) et répertoires déjà visités
+// sont écartés d'emblée. La pile explicite élimine tout risque de débordement de pile
+// d'appels sur des arborescences arbitrairement profondes.
+static void scanRecursive(const fs::path& startDir, DirStats& st)
 {
-    std::wstring pattern = dir.wstring();
-    for (wchar_t& c : pattern)
-        if (c == L'/')
-            c = L'\\';
-    if (!pattern.empty() && pattern.back() != L'\\')
-        pattern += L'\\';
-    pattern += L'*';
+    std::vector<fs::path> dirsToVisit;
+    dirsToVisit.push_back(startDir);
 
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
-                                FindExSearchNameMatch, nullptr,
-                                FIND_FIRST_EX_LARGE_FETCH);
-    if (h == INVALID_HANDLE_VALUE) {
-        std::cerr << "avertissement : lecture impossible de " << toUtf8(dir)
-                  << " (erreur Windows " << GetLastError() << ")\n";
-        return;
-    }
-    do {
-        const bool isDot = fd.cFileName[0] == L'.' &&
-            (fd.cFileName[1] == L'\0' ||
-             (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0'));
-        if (isDot || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-            continue;  // "." / ".." et liens symboliques / jonctions : ignorés
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            scanRecursive(dir / fd.cFileName, st);
-        } else {
-            ULARGE_INTEGER sz;
-            sz.LowPart = fd.nFileSizeLow;
-            sz.HighPart = fd.nFileSizeHigh;
-            accountFile(st, sz.QuadPart, fileTimeToTimeT(fd.ftLastWriteTime));
+    while (!dirsToVisit.empty()) {
+        fs::path dir = std::move(dirsToVisit.back());
+        dirsToVisit.pop_back();
+
+        if (alreadyScanned(dir))
+            continue;
+
+        std::wstring pattern = toExtendedPath(dir);
+        if (!pattern.empty() && pattern.back() != L'\\')
+            pattern += L'\\';
+        pattern += L'*';
+
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
+                                    FindExSearchNameMatch, nullptr,
+                                    FIND_FIRST_EX_LARGE_FETCH);
+        if (h == INVALID_HANDLE_VALUE) {
+            std::cerr << "avertissement : lecture impossible de " << toUtf8(dir)
+                      << " (erreur Windows " << GetLastError() << ")\n";
+            continue;
         }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
+        do {
+            const bool isDot = fd.cFileName[0] == L'.' &&
+                (fd.cFileName[1] == L'\0' ||
+                 (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0'));
+            if (isDot || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
+                continue;  // "." / ".." et liens symboliques / jonctions : ignorés
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                dirsToVisit.push_back(dir / fd.cFileName);
+            } else {
+                ULARGE_INTEGER sz;
+                sz.LowPart = fd.nFileSizeLow;
+                sz.HighPart = fd.nFileSizeHigh;
+                accountFile(st, sz.QuadPart, fileTimeToTimeT(fd.ftLastWriteTime));
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
 }
 #else
 // Protection anti-cycles : un bind mount peut faire boucler l'arborescence
@@ -305,29 +375,42 @@ static bool alreadyScanned(const fs::path& dir)
     return !g_visitedDirs.insert({sb.st_dev, sb.st_ino}).second;
 }
 
-static void scanRecursive(const fs::path& dir, DirStats& st)
+static void scanRecursive(const fs::path& startDir, DirStats& st)
 {
-    if (alreadyScanned(dir))
-        return;  // déjà visité : bind mount en amont, ou cycle
-    std::error_code ec;
-    fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
-    if (ec) {
-        std::cerr << "avertissement : lecture impossible de " << toUtf8(dir)
-                  << " (" << ec.message() << ")\n";
-        return;
-    }
-    for (const fs::directory_entry& entry : it) {
-        std::error_code lec;
-        if (entry.is_symlink(lec))
+    std::vector<fs::path> dirsToVisit;
+    dirsToVisit.push_back(startDir);
+
+    while (!dirsToVisit.empty()) {
+        fs::path dir = std::move(dirsToVisit.back());
+        dirsToVisit.pop_back();
+
+        if (alreadyScanned(dir))
+            continue;  // déjà visité : bind mount en amont, ou cycle
+
+        std::error_code ec;
+        fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
+        if (ec) {
+            std::cerr << "avertissement : lecture impossible de " << toUtf8(dir)
+                      << " (" << ec.message() << ")\n";
             continue;
-        if (entry.is_directory(lec)) {
-            scanRecursive(entry.path(), st);
-        } else if (entry.is_regular_file(lec)) {
-            // Un seul stat() par fichier : taille et mtime d'un seul appel,
-            // st_mtime étant déjà un time_t exact (signé : dates < 1970 OK).
-            struct stat sb;
-            if (::stat(entry.path().c_str(), &sb) == 0)
-                accountFile(st, static_cast<std::uintmax_t>(sb.st_size), sb.st_mtime);
+        }
+        for (const fs::directory_entry& entry : it) {
+            std::error_code ec_sym;
+            if (entry.is_symlink(ec_sym))
+                continue;
+            std::error_code ec_dir;
+            if (entry.is_directory(ec_dir)) {
+                dirsToVisit.push_back(entry.path());
+            } else {
+                std::error_code ec_reg;
+                if (entry.is_regular_file(ec_reg)) {
+                    // Un seul stat() par fichier : taille et mtime d'un seul appel,
+                    // st_mtime étant déjà un time_t exact (signé : dates < 1970 OK).
+                    struct stat sb;
+                    if (::stat(entry.path().c_str(), &sb) == 0)
+                        accountFile(st, static_cast<std::uintmax_t>(sb.st_size), sb.st_mtime);
+                }
+            }
         }
     }
 }
@@ -359,10 +442,11 @@ int main(int argc, char* argv[])
         return 1;
     }
     for (const fs::directory_entry& entry : it) {
-        std::error_code e2;
-        if (entry.is_symlink(e2))
+        std::error_code ec_sym;
+        if (entry.is_symlink(ec_sym))
             continue;
-        if (entry.is_directory(e2)) {
+        std::error_code ec_dir;
+        if (entry.is_directory(ec_dir)) {
 #ifdef _WIN32
             if (isReparsePoint(entry.path()))
                 continue;  // jonction NTFS : jamais suivie
@@ -373,8 +457,11 @@ int main(int argc, char* argv[])
             std::cout << "  " << st.name << " : " << st.files << " fichier(s), "
                       << st.size << " octets\n";
             rows.push_back(std::move(st));
-        } else if (entry.is_regular_file(e2)) {
-            addFile(entry, rootFiles);
+        } else {
+            std::error_code ec_reg;
+            if (entry.is_regular_file(ec_reg)) {
+                addFile(entry, rootFiles);
+            }
         }
     }
 
@@ -411,8 +498,14 @@ int main(int argc, char* argv[])
         writeRow(st);
     writeRow(total);
 
+    out.flush();
     if (!out) {
         std::cerr << "erreur : echec d'ecriture dans " << toUtf8(outPath) << "\n";
+        return 1;
+    }
+    out.close();
+    if (!out) {
+        std::cerr << "erreur : echec de fermeture de " << toUtf8(outPath) << "\n";
         return 1;
     }
 

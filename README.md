@@ -90,10 +90,14 @@ Notes:
   layouts, junctioned top-level directories).
 - Hard-linked files are counted once per directory entry (same as
   `Get-ChildItem`).
-- On Linux, already-visited directories are tracked by `(device, inode)`, so
-  bind-mount cycles cannot hang the scan and a tree bind-mounted in two places
-  is counted once (same approach as `find`/`du`). Symlinks are skipped via
-  `is_symlink()` there, which behaves correctly on POSIX.
+- Traversal is iterative using an explicit heap-allocated worklist rather than
+  call-stack recursion, preventing call-stack overflows even on deeply nested
+  trees (thousands of levels). On Windows, extended path prefixes (`\\?\`) are
+  applied to support paths beyond `MAX_PATH` (up to 32,767 characters).
+- Already-visited directories are tracked to prevent infinite loops and duplicate
+  traversals: on Linux by `(device, inode)` (protecting against bind-mount cycles,
+  same as `find`/`du`), and on Windows by Win32 file ID (`volumeSerialNumber` +
+  64-bit `fileIndex`).
 - File modification dates before 1970 are supported on both platforms
   (signed FILETIME math + Win32 `SystemTimeToTzSpecificLocalTime` on Windows,
   where the UCRT `localtime` rejects negative `time_t`).
